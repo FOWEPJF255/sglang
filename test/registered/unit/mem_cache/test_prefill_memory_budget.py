@@ -161,9 +161,8 @@ class TestSharedPrefillAdmission(unittest.TestCase):
         allocator = _shared_allocator(
             page_size=page_size, pool_tokens=pool_pages * page_size
         )
-        # The admission arithmetic below is tuned to this pool; a resize would
-        # measure something else, so pin the geometry rather than assume it.
-        self.assertEqual(allocator.size_full, pool_pages * page_size)
+        # Each end may borrow the other's unused initial share.
+        self.assertEqual(allocator.size_full, 2 * pool_pages * page_size)
         req = Req(
             rid="unaligned-prompt",
             origin_input_text=None,

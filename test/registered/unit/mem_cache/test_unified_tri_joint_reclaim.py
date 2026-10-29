@@ -51,6 +51,9 @@ class TestTriJointReclaim(CustomTestCase):
 
     build = staticmethod(build_tri_cache)
 
+    # Pressure budgets below include the arena and five request-table rows:
+    # four configured requests, plus the sink row.
+
     def stamp(self, b, a, slots, states, full_layers=1):
         kv = b.token_to_kv_pool
         for layer in range(kv.layer_num):
@@ -259,7 +262,9 @@ class TestTriJointReclaim(CustomTestCase):
 
         for occupancy in (0, 2):
             with self.subTest(cached_pages=occupancy):
-                b, a, c = self.build(page_size=4, state_cache=False)
+                b, a, c = self.build(
+                    page_size=4, state_cache=False, total_bytes=25984 + 5 * 4104
+                )
                 states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 self.assertIsNotNone(states)
                 slots = a.alloc(occupancy * 4)
@@ -631,7 +636,7 @@ class TestTriJointReclaim(CustomTestCase):
         for occupancy, demand in ((96, 10), (97, 1)):
             with self.subTest(occupancy=occupancy, demand=demand):
                 group = 1
-                b, a, c = self.build(temporal=(1, 4, 8))
+                b, a, c = self.build(temporal=(1, 4, 8), total_bytes=7808 + 5 * 1032)
                 states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 slots = a.alloc(occupancy)
                 self.stamp(b, a, slots, states)
@@ -702,7 +707,9 @@ class TestTriJointReclaim(CustomTestCase):
     def test_temporal_state_first_stops_after_one_victim(self):
         for lazy in (False, True):
             with self.subTest(lazy=lazy):
-                b, a, c = self.build(lazy=lazy, temporal=(1, 4, 8))
+                b, a, c = self.build(
+                    lazy=lazy, temporal=(1, 4, 8), total_bytes=7808 + 5 * 1032
+                )
                 states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 slots = a.alloc(96)
                 self.stamp(b, a, slots, states)
@@ -784,7 +791,9 @@ class TestTriJointReclaim(CustomTestCase):
     def test_float_plan_rechecks_pins_taken_during_preparation(self):
         for owner in ("full", "mamba", "swa"):
             with self.subTest(owner=owner):
-                b, a, c = self.build(lazy=True, temporal=(1, 4, 8))
+                b, a, c = self.build(
+                    lazy=True, temporal=(1, 4, 8), total_bytes=7808 + 5 * 1032
+                )
                 states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 slots = a.alloc(96)
                 self.stamp(b, a, slots, states)

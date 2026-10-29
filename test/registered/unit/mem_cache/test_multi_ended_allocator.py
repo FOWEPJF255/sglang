@@ -1900,7 +1900,6 @@ class TestPagedBand(unittest.TestCase):
     # OOB kernel inputs.
     def test_paged_pool_translate_helper_returns_physical_tokens(self):
         from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
-        from sglang.srt.mem_cache.kv.alloc.interim import _virtual_tokens_to_physical
 
         full_spec = MHASubPoolSpec(
             name="full",
@@ -1948,7 +1947,7 @@ class TestPagedBand(unittest.TestCase):
         v_tokens = allocator.alloc(2 * PS)
         self.assertIsNotNone(v_tokens)
 
-        swa_phys = _virtual_tokens_to_physical(v_tokens, allocator.swa_attn_allocator)
+        swa_phys = allocator.swa_attn_allocator.ids.translate(v_tokens)
 
         self.assertTrue(
             bool((swa_phys >= 0).all().item()),
@@ -3422,7 +3421,6 @@ class TestDcpWidening(unittest.TestCase):
                 )
                 mamba_slots = UnifiedMambaSlotAllocator(
                     allocator.mamba_allocator,
-                    max_size=allocator.mamba_allocator.max_slots - 1,
                     device=_DEV,
                 )
 
@@ -3481,7 +3479,6 @@ class TestDcpWidening(unittest.TestCase):
             )
             mamba_slots = UnifiedMambaSlotAllocator(
                 allocator.mamba_allocator,
-                max_size=allocator.mamba_allocator.max_slots - 1,
                 device=_DEV,
             )
 

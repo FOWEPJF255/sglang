@@ -665,6 +665,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             forward_batch.mamba_track_indices = self._translate_mamba_indices(
                 forward_batch.mamba_track_indices
             )
+        self.state_tracking_indices = forward_batch.mamba_track_indices
         track_rows = None
         if forward_batch.mamba_track_mask is not None:
             assert meta.track, (

@@ -107,6 +107,8 @@ class MambaAttnBackendBase(AttentionBackend):
             torch.device(self.device).type == "cuda" and pool.holds_state_slots
         )
         self.forward_metadata: ForwardMetadata = None
+        # Current physical tracking destinations, shared with other state readers.
+        self.state_tracking_indices: Optional[torch.Tensor] = None
         self.state_indices_list = []
         # Static (max_bs,) track-dest buffer captured by pointer, refreshed in-place
         # each replay; the captured track-save reads this, not the InputBuffer slot.
@@ -213,6 +215,7 @@ class MambaAttnBackendBase(AttentionBackend):
             forward_batch.mamba_track_indices = self._translate_mamba_indices(
                 forward_batch.mamba_track_indices
             )
+        self.state_tracking_indices = forward_batch.mamba_track_indices
         # Resolve the tracked-row selection once per forward
         cpu_track_metadata = self._has_cpu_prefill_track_metadata(forward_batch)
         if cpu_track_metadata:
@@ -708,6 +711,11 @@ class MambaAttnBackendBase(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
+        self.state_tracking_indices = (
+            None
+            if self.mamba_track_indices_buf is None
+            else self.mamba_track_indices_buf[:bs]
+        )
         if forward_mode.is_decode_or_idle():
             self.query_start_loc_list[bs - 1].copy_(
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
@@ -825,6 +833,7 @@ class MambaAttnBackendBase(AttentionBackend):
             )
             track_buf = self.mamba_track_indices_buf[:bs]
             track_buf.copy_(self._translate_mamba_indices(mamba_track_indices[:bs]))
+        self.state_tracking_indices = track_buf
         # Refresh the static write cursor in-place (mirrors the eager
         # snapshot-then-advance). Skip the advance during capture: dummy slots
         # would corrupt real ring positions.

@@ -128,11 +128,6 @@ class _InterimPolicy:
         them, by sub-pool name: tokens, or slots for a state sub-pool."""
         raise NotImplementedError
 
-    def resize(self, c: ChainAllocator, config) -> None:
-        raise NotImplementedError(
-            "post-capture resize is planned only for a full + sliding-window chain"
-        )
-
     def memo_violations(self, c: ChainAllocator) -> List[str]:
         return []
 
@@ -217,9 +212,6 @@ class _TokenAndSlotEndsPolicy(_InterimPolicy):
             // c.full_attn_allocator.entry_bytes
         )
 
-    def resize(self, c: ChainAllocator, config) -> None:
-        BaseTokenToKVPoolAllocator.resize(c, config)
-
     cpu_copy_carries_state = True
 
     def get_cpu_copy(
@@ -289,7 +281,8 @@ class _WindowPolicy(_InterimPolicy):
         return min(self._size_full, self._size_swa)
 
     def size_full(self, c: ChainAllocator) -> int:
-        return self._size_full
+        cap = c.full_attn_allocator.max_live_tokens
+        return self._size_full if cap is None else min(self._size_full, cap)
 
     def size_swa(self, c: ChainAllocator) -> int:
         return self._size_swa
@@ -683,52 +676,6 @@ class _TokenEndsPolicy(_WindowPolicy):
         # A zero-reclaim plan can still depend on compaction before allocation.
         return c.ensure_capacity(num_tokens, required_swa)
 
-    def resize(self, c: ChainAllocator, config) -> None:
-        """Synchronize allocator capacity after the shared pool is finalized."""
-        if not c.arena.backed_after_capture:
-            raise RuntimeError("ChainAllocator.resize requires post-capture backing")
-        final_pool_bytes = config.unified_memory_pool_bytes
-        if final_pool_bytes is None:
-            raise ValueError(
-                "ChainAllocator.resize requires config.unified_memory_pool_bytes"
-            )
-        if int(final_pool_bytes) != c.arena.total_bytes:
-            raise RuntimeError(
-                "the arena must be backed before allocator.resize: "
-                f"config has {int(final_pool_bytes)} bytes but the pool exposes "
-                f"{c.arena.total_bytes} bytes"
-            )
-        fa, sa = c.full_attn_allocator, c.swa_attn_allocator
-        for allocator in (fa, sa):
-            if allocator.allocated_count() != 0 or allocator._pending_reuse:
-                raise RuntimeError(
-                    f"cannot resize non-empty unified allocator "
-                    f"{allocator.sub_pool_name!r}"
-                )
-        fa._set_capacity(c.arena.num_entries(fa.sub_pool_name))
-        sa._set_capacity(
-            c.arena.num_entries(sa.sub_pool_name),
-            virtual_num_pages=fa.ids.num_virtual_ids,
-        )
-        self._empty_shared_gap_bytes = fa._current_gap_bytes()
-        self._size_full = fa.available_size()
-        self._size_swa = min(
-            sa.available_size(),
-            len(fa.free_virtual_ids) * c.page_size,
-        )
-        self._full_max_total_num_tokens = self._size_full
-        self._swa_max_total_num_tokens = self._size_swa
-        c.get_kvcache().size = fa.max_slots - 1
-        for allocator, host_capacity in (
-            (fa, self._size_full),
-            (sa, self._size_swa),
-        ):
-            pool = c.views[allocator.sub_pool_name]
-            pool.num_pages = allocator.num_pages
-            pool.size = allocator.num_pages * c.page_size - c.page_size
-            pool.host_capacity_tokens = host_capacity
-            pool.host_capacity_bytes = host_capacity * allocator.entry_bytes
-
 
 class _FloatChainPolicy(_WindowPolicy):
     """A slot end, the window floating in the middle, and the owner end:
@@ -991,6 +938,8 @@ class _FloatChainPolicy(_WindowPolicy):
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
         full_reclaim = tree_cache.full_evictable_size()
+        if c._full_cap_reclaim(num_tokens) > full_reclaim:
+            return False
         swa_reclaim = tree_cache.swa_evictable_size()
         state_reclaim = tree_cache.mamba_evictable_size()
         fa, sa, ma = (
@@ -1026,8 +975,9 @@ class _FloatChainPolicy(_WindowPolicy):
         if full_reclaim or swa_reclaim:
             result = tree_cache.evict_for_alloc(
                 EvictParams(num_tokens=num_tokens, swa_num_tokens=num_tokens),
-                allocation_reclaim_satisfied=lambda: float_reclaim_satisfied(
-                    _snapshot(c), chain, num_tokens
+                allocation_reclaim_satisfied=lambda: (
+                    not c._full_cap_reclaim(num_tokens)
+                    and float_reclaim_satisfied(_snapshot(c), chain, num_tokens)
                 ),
             )
             state_freed = result.mamba_num_evicted
@@ -1047,8 +997,9 @@ class _FloatChainPolicy(_WindowPolicy):
         if state_quota and tree_cache.mamba_evictable_size():
             result = tree_cache.evict_for_alloc(
                 EvictParams(mamba_num=state_quota),
-                allocation_reclaim_satisfied=lambda: float_reclaim_satisfied(
-                    _snapshot(c), chain, num_tokens
+                allocation_reclaim_satisfied=lambda: (
+                    not c._full_cap_reclaim(num_tokens)
+                    and float_reclaim_satisfied(_snapshot(c), chain, num_tokens)
                 ),
             )
             if (
