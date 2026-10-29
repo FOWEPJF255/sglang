@@ -346,8 +346,13 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
         allocator.can_reserve = MagicMock(
             side_effect=AssertionError("two-pool reservation")
         )
-        allocator.full_attn_allocator = SimpleNamespace(entry_bytes=64)
-        allocator.swa_attn_allocator = SimpleNamespace(entry_bytes=64)
+        allocator.full_attn_allocator = SimpleNamespace(
+            entry_bytes=64, entry_bytes_per_page=64 * allocator.page_size
+        )
+        allocator.swa_attn_allocator = SimpleNamespace(
+            entry_bytes=64, entry_bytes_per_page=64 * allocator.page_size
+        )
+        allocator.window_allocators = {"swa": allocator.swa_attn_allocator}
         allocator.mamba_allocator = SimpleNamespace(
             entry_bytes_per_page=256, schedulable_available_size=lambda: 8
         )

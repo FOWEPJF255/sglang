@@ -433,116 +433,6 @@ class TestDeclaredParts(CustomTestCase):
             ),
         ):
             self.assertEqual(len(cfg._kv_layer_decls()), 2)
-    def test_multi_window_admission_reclaims_cached_state(self):
-        from sglang.srt.mem_cache.base_prefix_cache import (
-            InsertParams,
-            MatchPrefixParams,
-        )
-        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-        from sglang.srt.mem_cache.layout.fused_draft import (
-            DenseDraftRegion,
-            DraftBand,
-            FusedDraftPlacement,
-        )
-        from sglang.srt.mem_cache.radix_cache import RadixKey
-        from sglang.srt.mem_cache.unified_cache.components import ComponentType
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-
-        placement = FusedDraftPlacement.from_counts(
-            counts={"draft_swa": [1]},
-            regions={
-                "draft_swa": DenseDraftRegion(
-                    lane_num=1, head_num=1, head_dim=8, store_dtype=torch.bfloat16
-                )
-            },
-            new_bands={"draft_swa": DraftBand(kind="window", window=32)},
-        )
-        for lazy in (False, True):
-            with self.subTest(lazy=lazy):
-                storage, _, _ = _build(
-                    state=True,
-                    window_with_state=True,
-                    fused_draft=placement,
-                    lazy_compaction=lazy,
-                )
-                a = storage.allocator
-                states = a.alloc_state_slots(16)
-                chunks = []
-                while a.ensure_capacity(4, 4):
-                    chunks.append(a.alloc(4))
-                cache = UnifiedRadixCache(
-                    CacheInitParams(
-                        disable=False,
-                        enable_mamba_extra_buffer=True,
-                        req_to_token_pool=storage.requests,
-                        token_to_kv_pool_allocator=a,
-                        page_size=4,
-                        sliding_window_size=16,
-                        tree_slots=tuple(
-                            msgspec.structs.replace(slot, checkpoint_interval=4)
-                            if slot.family == "state"
-                            else slot
-                            for slot in storage.tree_slots()
-                        ),
-                        tree_core_backend="python",
-                    )
-                )
-                nodes = []
-                for i, state in enumerate(states):
-                    value = torch.cat(chunks[i :: len(states)])
-                    key = RadixKey(list(range(i * 10000, i * 10000 + len(value))))
-                    cache.insert(
-                        InsertParams(
-                            key=key,
-                            value=value.clone(),
-                            mamba_value=state.reshape(1),
-                        )
-                    )
-                    nodes.append(
-                        cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
-                    )
-                budget = a.create_prefill_budget(cache)
-                self.assertTrue(budget.state_slots_fit(budget.state_slot_cost))
-                demand = dict(
-                    extend_input_len=232,
-                    total_tokens=240,
-                    max_new_tokens=0,
-                    input_tokens=232,
-                    swa_host_hit_length=0,
-                    chunk_limit=16,
-                )
-                # An idle cache must reach reclamation before admission can stop.
-                self.assertTrue(budget.check_prefill(**demand)[0])
-                receipts = [
-                    cache.inc_lock_ref(
-                        node,
-                        skip_lock_components=(
-                            ComponentType.FULL,
-                            ComponentType.SWA,
-                            ComponentType.AUXILIARY_SWA,
-                        ),
-                    )
-                    for node in nodes
-                ]
-                try:
-                    self.assertEqual(cache.mamba_evictable_size(), 0)
-                    self.assertFalse(budget.check_prefill(**demand)[0])
-                finally:
-                    for node, receipt in zip(nodes, receipts):
-                        cache.dec_lock_ref(node, receipt.to_dec_params())
-                self.assertTrue(budget.check_prefill(**demand)[0])
-                self.assertIsNone(a.reclaim_for_prealloc(cache, 240, 20))
-                incoming_state = a.alloc_state_slots(1)
-                self.assertIsNotNone(incoming_state)
-                first_chunk = a.alloc(16)
-                self.assertIsNotNone(first_chunk)
-                budget.reserve(
-                    232, 0, state_slot_tokens=budget.state_slot_cost, chunk_limit=16
-                )
-                self.assertFalse(budget.check_prefill(**demand)[0])
-                a.free(first_chunk)
-                a.state_slots.free(incoming_state)
-                self.assertEqual(storage.accounting_violations(), [])
 
     def test_window_shares_do_not_limit_shared_arena_borrowing(self):
         """A long FULL history may borrow bytes released by its short window."""
@@ -880,6 +770,117 @@ class TestDeclaredParts(CustomTestCase):
         slots = storage.allocator.alloc_state_slots(count)
         self.assertIsNotNone(slots)
         self.assertEqual(slots.numel(), count)
+
+    def test_multi_window_admission_reclaims_cached_state(self):
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            InsertParams,
+            MatchPrefixParams,
+        )
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.unified_cache.components import ComponentType
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        placement = FusedDraftPlacement.from_counts(
+            counts={"draft_swa": [1]},
+            regions={
+                "draft_swa": DenseDraftRegion(
+                    lane_num=1, head_num=1, head_dim=8, store_dtype=torch.bfloat16
+                )
+            },
+            new_bands={"draft_swa": DraftBand(kind="window", window=32)},
+        )
+        for lazy in (False, True):
+            with self.subTest(lazy=lazy):
+                storage, _, _ = _build(
+                    state=True,
+                    window_with_state=True,
+                    fused_draft=placement,
+                    lazy_compaction=lazy,
+                )
+                a = storage.allocator
+                states = a.alloc_state_slots(16)
+                chunks = []
+                while a.ensure_capacity(4, 4):
+                    chunks.append(a.alloc(4))
+                cache = UnifiedRadixCache(
+                    CacheInitParams(
+                        disable=False,
+                        enable_mamba_extra_buffer=True,
+                        req_to_token_pool=storage.requests,
+                        token_to_kv_pool_allocator=a,
+                        page_size=4,
+                        sliding_window_size=16,
+                        tree_slots=tuple(
+                            msgspec.structs.replace(slot, checkpoint_interval=4)
+                            if slot.family == "state"
+                            else slot
+                            for slot in storage.tree_slots()
+                        ),
+                        tree_core_backend="python",
+                    )
+                )
+                nodes = []
+                for i, state in enumerate(states):
+                    value = torch.cat(chunks[i :: len(states)])
+                    key = RadixKey(list(range(i * 10000, i * 10000 + len(value))))
+                    cache.insert(
+                        InsertParams(
+                            key=key,
+                            value=value.clone(),
+                            mamba_value=state.reshape(1),
+                        )
+                    )
+                    nodes.append(
+                        cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
+                    )
+                budget = a.create_prefill_budget(cache)
+                self.assertTrue(budget.state_slots_fit(budget.state_slot_cost))
+                demand = dict(
+                    extend_input_len=232,
+                    total_tokens=240,
+                    max_new_tokens=0,
+                    input_tokens=232,
+                    swa_host_hit_length=0,
+                    chunk_limit=16,
+                )
+                # An idle cache must reach reclamation before admission can stop.
+                self.assertTrue(budget.check_prefill(**demand)[0])
+                receipts = [
+                    cache.inc_lock_ref(
+                        node,
+                        skip_lock_components=(
+                            ComponentType.FULL,
+                            ComponentType.SWA,
+                            ComponentType.AUXILIARY_SWA,
+                        ),
+                    )
+                    for node in nodes
+                ]
+                try:
+                    self.assertEqual(cache.mamba_evictable_size(), 0)
+                    self.assertFalse(budget.check_prefill(**demand)[0])
+                finally:
+                    for node, receipt in zip(nodes, receipts):
+                        cache.dec_lock_ref(node, receipt.to_dec_params())
+                self.assertTrue(budget.check_prefill(**demand)[0])
+                self.assertIsNone(a.reclaim_for_prealloc(cache, 240, 20))
+                incoming_state = a.alloc_state_slots(1)
+                self.assertIsNotNone(incoming_state)
+                first_chunk = a.alloc(16)
+                self.assertIsNotNone(first_chunk)
+                budget.reserve(
+                    232, 0, state_slot_tokens=budget.state_slot_cost, chunk_limit=16
+                )
+                self.assertFalse(budget.check_prefill(**demand)[0])
+                a.free(first_chunk)
+                a.state_slots.free(incoming_state)
+                self.assertEqual(storage.accounting_violations(), [])
 
     def test_multi_window_reclaim_uses_unlocked_state_checkpoints(self):
         from unittest.mock import patch
@@ -2628,6 +2629,95 @@ class TestDeclaredParts(CustomTestCase):
                     larger.max_running_requests, captured.max_running_requests
                 )
                 self.assertLessEqual(larger.full_tokens, captured.full_tokens)
+
+    def test_dcp_window_policy_separates_logical_and_host_capacities(self):
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+
+        capacities = {}
+        for factor in (1, 2, 4):
+            for shape in ("window", "float", "multi"):
+                with self.subTest(dcp=factor, shape=shape):
+                    setup_allocator_context()
+                    with get_parallel().override(attn_dcp_size=factor, attn_dcp_rank=0):
+                        placement = (
+                            None
+                            if shape == "window"
+                            else FusedDraftPlacement.from_counts(
+                                counts={"draft_swa": [1]},
+                                regions={
+                                    "draft_swa": DenseDraftRegion(
+                                        lane_num=1,
+                                        head_num=1,
+                                        head_dim=8,
+                                        store_dtype=torch.bfloat16,
+                                        token_replicas=factor,
+                                    )
+                                },
+                                new_bands={
+                                    "draft_swa": DraftBand(kind="window", window=32)
+                                },
+                            )
+                        )
+                        storage, _, sized = _build(
+                            state=shape != "window",
+                            window_with_state=shape == "multi",
+                            fused_draft=placement,
+                            setup=False,
+                        )
+                        a = storage.allocator
+                        if factor == 1:
+                            capacities[shape] = (a.size_full, a.size_swa)
+                        full_capacity, window_capacity = capacities[shape]
+                        self.assertEqual(a.size_full, full_capacity * factor)
+                        self.assertEqual(a.size_swa, window_capacity * factor)
+                        for band, capacity in (
+                            (a.full_attn_allocator, full_capacity),
+                            *((b, window_capacity) for b in a._windows),
+                        ):
+                            view = a.views[band.sub_pool_name]
+                            self.assertEqual(view.host_capacity_tokens, capacity)
+                            self.assertEqual(
+                                view.host_capacity_bytes, capacity * band.entry_bytes
+                            )
+                            self.assertEqual(
+                                storage.host_layout(band.sub_pool_name).capacity,
+                                capacity * factor,
+                            )
+                        if a.mamba_allocator is not None:
+                            token_page_bytes = sum(
+                                b.entry_bytes_per_page
+                                for b in (a.full_attn_allocator, *a._windows)
+                            )
+                            expected_cost = -(
+                                -a.mamba_allocator.entry_bytes
+                                * a.page_size
+                                // token_page_bytes
+                            )
+                            self.assertEqual(
+                                a.admission_rules().state_slot_cost, expected_cost
+                            )
+                        ids = a.alloc(32 * factor)
+                        self.assertIsNotNone(ids)
+                        self.assertEqual(
+                            a.conserve_swa_available_size(),
+                            (window_capacity - 32) * factor,
+                        )
+                        self.assertGreater(a.swa_available_size(), 0)
+                        full, window = a.swa_capacity_and_available(
+                            full_capacity=sized.full_tokens,
+                            swa_capacity=sized.window_tokens,
+                        )
+                        self.assertEqual(window[0] - window[1], 32 * factor)
+                        a.free(ids)
+                        self.assertEqual(
+                            a.conserve_swa_available_size(),
+                            window_capacity * factor,
+                        )
+                        self.assertEqual(storage.accounting_violations(), [])
 
     def test_runtime_budget_adapter_returns_the_declared_plan_sizes(self):
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
