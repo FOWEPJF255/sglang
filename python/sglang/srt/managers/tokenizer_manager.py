@@ -2770,7 +2770,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         else 0
                     )
                     meta_info.update(
-                        state.time_stats.convert_to_output_meta_info(completion_tokens)
+                        state.time_stats.convert_to_output_meta_info(
+                            _scheduler_time_stats(recv_obj, i),
+                            completion_tokens,
+                            num_retractions=recv_obj.retraction_counts[i],
+                        )
                     )
 
                 del self.rid_to_state[rid]
