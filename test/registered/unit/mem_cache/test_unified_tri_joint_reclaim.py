@@ -51,8 +51,8 @@ class TestTriJointReclaim(CustomTestCase):
 
     build = staticmethod(build_tri_cache)
 
-    # Pressure budgets below include the arena and five request-table rows:
-    # four configured requests, plus the sink row.
+    # Pressure budgets below include the arena and three request-table rows:
+    # two requests (eight state slots / three per request), plus the sink row.
 
     def stamp(self, b, a, slots, states, full_layers=1):
         kv = b.token_to_kv_pool
@@ -263,7 +263,7 @@ class TestTriJointReclaim(CustomTestCase):
         for occupancy in (0, 2):
             with self.subTest(cached_pages=occupancy):
                 b, a, c = self.build(
-                    page_size=4, state_cache=False, total_bytes=25984 + 5 * 4104
+                    page_size=4, state_cache=False, total_bytes=25984 + 3 * 4104
                 )
                 states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 self.assertIsNotNone(states)
@@ -636,7 +636,7 @@ class TestTriJointReclaim(CustomTestCase):
         for occupancy, demand in ((96, 10), (97, 1)):
             with self.subTest(occupancy=occupancy, demand=demand):
                 group = 1
-                b, a, c = self.build(temporal=(1, 4, 8), total_bytes=7808 + 5 * 1032)
+                b, a, c = self.build(temporal=(1, 4, 8), total_bytes=7808 + 3 * 1032)
                 states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 slots = a.alloc(occupancy)
                 self.stamp(b, a, slots, states)
@@ -708,7 +708,7 @@ class TestTriJointReclaim(CustomTestCase):
         for lazy in (False, True):
             with self.subTest(lazy=lazy):
                 b, a, c = self.build(
-                    lazy=lazy, temporal=(1, 4, 8), total_bytes=7808 + 5 * 1032
+                    lazy=lazy, temporal=(1, 4, 8), total_bytes=7808 + 3 * 1032
                 )
                 states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 slots = a.alloc(96)
@@ -792,7 +792,7 @@ class TestTriJointReclaim(CustomTestCase):
         for owner in ("full", "mamba", "swa"):
             with self.subTest(owner=owner):
                 b, a, c = self.build(
-                    lazy=True, temporal=(1, 4, 8), total_bytes=7808 + 5 * 1032
+                    lazy=True, temporal=(1, 4, 8), total_bytes=7808 + 3 * 1032
                 )
                 states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 slots = a.alloc(96)
