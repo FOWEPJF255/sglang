@@ -215,6 +215,9 @@ class SchedulerMlxOverlapMixin:
                 break
 
             self.ingest_requests()
+            self.drain_requested_finishes(
+                uncommitted=[job.batch_copy for job in self.result_queue]
+            )
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -233,6 +236,8 @@ class SchedulerMlxOverlapMixin:
                 and pending_curr.launch.decode is not None
                 and pending_curr.chain_safe
                 and not self.waiting_queue
+                # A request with a requested finish never joins a new step.
+                and not self.requested_finishes.among(pending_curr.reqs)
             )
             if can_chain:
                 # Build + launch the chained step BEFORE we block on

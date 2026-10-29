@@ -1278,9 +1278,8 @@ class Req(ReqDllmMixin):
         self.finished_output = None
         # Owned by Scheduler.defer_response until its completion is retired.
         self.defer_output = False
-        # If we want to abort the request in the middle of the event loop,
-        # call request_finish instead of finish_outside_step.
-        # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
+        # A finish the request's next commit applies. A finish decided while
+        # it runs goes through Scheduler.requested_finishes instead.
         self.to_finish: Optional[BaseFinishReason] = None
         self.stream = stream
         self.eos_token_ids = eos_token_ids
@@ -1503,9 +1502,6 @@ class Req(ReqDllmMixin):
             bootstrap_host == FAKE_BOOTSTRAP_HOST
             or positional_embed_overrides is not None
         )
-        # Set when the request's in-flight forward ran on KV that never landed:
-        # that forward's output is dropped and the request finishes with it.
-        self.discard_output_reason: Optional[FINISH_ABORT] = None
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
@@ -2115,10 +2111,6 @@ class Req(ReqDllmMixin):
     def request_finish(self, reason: BaseFinishReason) -> None:
         """Finish with reason at the request's next commit."""
         self.to_finish = reason
-
-    def request_discard(self, reason: FINISH_ABORT) -> None:
-        """Drop the output of the request's in-flight step and finish with reason."""
-        self.discard_output_reason = reason
 
     def clear_requested_finish(self) -> None:
         """Drop the finish requested for the next commit."""

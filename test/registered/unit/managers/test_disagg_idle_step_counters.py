@@ -21,6 +21,9 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.requested_finishes import (
+    RequestedFinishes,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
@@ -326,7 +329,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         )
         scheduler.result_queue = deque([pending])
 
-        self.assertEqual(scheduler.collect_inflight_reqs(), {req})
+        self.assertEqual(scheduler.collect_inflight_reqs(), [req])
 
     def test_split_prefill_is_charged_once_from_its_first_chunk(self):
         # A split prefill spans several run_batch calls but yields one result,
@@ -621,6 +624,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.running_batch = ScheduleBatch(reqs=[])
         scheduler.last_batch = None
         scheduler.chunked_req = None
+        scheduler.requested_finishes = RequestedFinishes()
         scheduler.waiting_queue = []
         scheduler.disagg_prefill_inflight_queue = []
         scheduler.enable_staging = False

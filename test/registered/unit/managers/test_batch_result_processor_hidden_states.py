@@ -172,7 +172,6 @@ class _PrefillReq:
         self.require_reasoning = False
         self.customized_info = None
         self.beam_group = None
-        self.discard_output_reason = None
 
     def finished(self):
         return False
@@ -271,7 +270,9 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                         return_value=SimpleNamespace(enable_hisparse=False),
                     ),
                 ):
-                    processor.process_batch_result_prefill(batch, result)
+                    processor.process_batch_result_prefill(
+                        batch, result, dropped_output={}
+                    )
 
                 self.assertEqual(middle.hidden_states, [])
                 self.assertEqual(last.hidden_states, [[22.0]])
@@ -315,7 +316,7 @@ class TestPrefillSkippedOutput(CustomTestCase):
             "get",
             return_value=True,
         ):
-            processor.process_batch_result_prefill(batch, result)
+            processor.process_batch_result_prefill(batch, result, dropped_output={})
 
         self.assertEqual(req.inflight_middle_chunks, 0)
         self.assertEqual(req.output_ids, [])
@@ -376,7 +377,7 @@ class TestMixedBatchKvRelease(CustomTestCase):
             ),
             patch.object(SchedulerBatchResultProcessor, "_maybe_collect_indexer_topk"),
         ):
-            processor.process_batch_result_prefill(batch, result)
+            processor.process_batch_result_prefill(batch, result, dropped_output={})
 
         self.assertEqual(release.call_count, 2)
         processor.model_worker.prepare_for_kv_cache_release.assert_called_once_with(

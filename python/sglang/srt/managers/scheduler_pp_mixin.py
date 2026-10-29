@@ -137,6 +137,9 @@ class SchedulerPPMixin:
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.ingest_requests()
+                self.drain_requested_finishes(
+                    uncommitted=self._pp_uncommitted_mbs(mb_id)
+                )
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
@@ -271,6 +274,9 @@ class SchedulerPPMixin:
                 next_batch_result = None
 
                 recv_reqs = self.ingest_requests()
+                self.drain_requested_finishes(
+                    uncommitted=self._pp_uncommitted_mbs(mb_id)
+                )
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -400,6 +406,9 @@ class SchedulerPPMixin:
                 next_batch_result = None
 
                 recv_reqs = self.ingest_requests()
+                self.drain_requested_finishes(
+                    uncommitted=self._pp_uncommitted_mbs(mb_id)
+                )
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -606,6 +615,19 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[
             str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]
         ] = defaultdict(deque)
+
+    def _pp_uncommitted_mbs(self: Scheduler, mb_id: int) -> List[ScheduleBatch]:
+        """The launched micro-batches whose results are not processed yet: all
+        but mb_id's, which the previous iteration processed. Each comes with
+        its forward-time snapshot, which the processing reads under PP+spec."""
+        uncommitted = []
+        for k, (batch, md) in enumerate(zip(self.mbs, self.mb_metadata)):
+            if k == mb_id or batch is None:
+                continue
+            uncommitted.append(batch)
+            if md is not None and md.fwd_batch is not None:
+                uncommitted.append(md.fwd_batch)
+        return uncommitted
 
     def process_bootstrapped_queue(self: Scheduler):
         reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()

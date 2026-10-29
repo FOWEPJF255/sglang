@@ -26,7 +26,18 @@ from collections import deque
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Deque,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 from sglang.srt.runtime_context import (
     SpawnRanks,
@@ -91,7 +102,6 @@ from sglang.srt.disaggregation.kv_events import uses_dynamo_format
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
-    maybe_release_metadata_buffer,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -215,6 +225,7 @@ from sglang.srt.managers.prefill_delayer import (
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
+    BaseFinishReason,
     MultimodalInputs,
     MultimodalProcessorOutput,
     NextBatchPlan,
@@ -283,6 +294,10 @@ from sglang.srt.managers.scheduler_components.recv_skipper import (
 )
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
+)
+from sglang.srt.managers.scheduler_components.requested_finishes import (
+    RequestedFinish,
+    RequestedFinishes,
 )
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
@@ -1346,6 +1361,7 @@ class Scheduler(
         self.result_queue: deque[
             tuple[ScheduleBatch, GenerationBatchResult | EmbeddingBatchResult]
         ] = deque()
+        self.requested_finishes = RequestedFinishes()
         self.enable_continuous_input_polling = False
         self.enable_skip_finishing_decode = False
         self.forward_ct = 0
@@ -1385,7 +1401,6 @@ class Scheduler(
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
         self.chunked_req = None
-        self._pending_chunked_abort_req = None
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
@@ -2046,6 +2061,7 @@ class Scheduler(
 
             # Receive requests
             self.ingest_requests()
+            self.drain_requested_finishes(uncommitted=())
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -2091,6 +2107,7 @@ class Scheduler(
 
             # Receive requests
             self.ingest_requests()
+            self.drain_requested_finishes(uncommitted=self._queued_batches())
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -3729,6 +3746,7 @@ class Scheduler(
                         req.rid in seen_rids
                         or req.finished()
                         or req.to_finish is not None
+                        or req in self.requested_finishes
                     ):
                         continue
                     seen_rids.add(req.rid)
@@ -3872,57 +3890,48 @@ class Scheduler(
         else:
             checkpoint_kv_cache(req, self.tree_cache)
 
-    def process_pending_chunked_abort(self) -> None:
-        """Abort an in-flight chunked-prefill request once it is safe to do so.
-
-        ``abort_request`` only records the target in ``_pending_chunked_abort_req``
-        (tearing it down mid-iteration is unsafe). Clearing ``chunked_req`` here at
-        the top of the scheduling step stops the next chunk from launching; the
-        chunk already launched is drained when its result is resolved. Under overlap
-        the result lands a step later, so the batch-result processors keep
-        ``inflight_middle_chunks`` accounting intact and skip the aborted chunk:
-        ``process_batch_result_disagg_prefill`` via its ``is_aborted`` drop, and
-        ``process_batch_result_prefill`` via its chunked branch (the finished req
-        is excluded from streaming and its logprob offset is still accounted).
-        Mirrors ``handle_bootstrap_failure``.
-        """
-        req = self._pending_chunked_abort_req
-        if req is None:
+    def drain_requested_finishes(
+        self, *, uncommitted: Iterable[Optional[ScheduleBatch]]
+    ) -> None:
+        """Finish each requested finish now, unless an uncommitted step carries
+        its request: that step's commit applies it. The chunked request
+        finishes now even with a chunk in flight, so no next chunk launches;
+        the in-flight chunk's commit only drains its accounting."""
+        if not self.requested_finishes:
             return
-        if self.chunked_req is not req:
-            # Already past chunked prefill; the running-batch abort path handles
-            # it. Drop the marker once the request is actually gone.
-            if req.finished() or not req.kv.holds_kv:
-                self._pending_chunked_abort_req = None
-                return
-            # The request moved to another scheduler queue after abort_request
-            # deferred it, so retry against its current location.
-            self._pending_chunked_abort_req = None
-            self.abort_request(AbortReq(rid=req.rid))
-            return
+        carried = {
+            req for batch in uncommitted if batch is not None for req in batch.reqs
+        }
+        for req in self.requested_finishes.reqs():
+            if req.finished():
+                self.requested_finishes.pop(req)
+            elif req is self.chunked_req or req not in carried:
+                self._finish_requested(req, self.requested_finishes.pop(req))
 
-        reason = req.discard_output_reason or FINISH_ABORT("Aborted")
-        prepare_abort(req, reason.message, reason.status_code)
-        req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
-        req.clear_requested_finish()
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.clear_pending_chunk_send(req)
-            req.disagg_kv_sender.abort()
-            maybe_release_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator
+    def _finish_requested(self, req: Req, finish: RequestedFinish) -> None:
+        """Finish a request no uncommitted step carries: release what it holds
+        as a commit releases a request it finishes, then stream its last
+        output."""
+        if req is self.chunked_req:
+            # Mid-prefill: the attempt ends and its partial KV is not cached.
+            self.chunked_req = None
+            reason = finish.reason
+            prepare_abort(req, reason.message, reason.status_code)
+            req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
+            self._release_aborted_request(req)
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                self.release_aborted_prefill_waiting_req(req)
+            else:
+                release_kv_cache(req, self.tree_cache, checkpoint=False)
+        else:
+            if req.beam_group is not None:
+                self.beam_coordinator.abort_group(req, finish.reason)
+            else:
+                req.finish_outside_step(finish.reason)
+            self.batch_result_processor.retire_finished_req(
+                req, checkpoint=not finish.drop_output
             )
-            req.pending_bootstrap = False
-        self._release_aborted_request(req)
-        release_kv_cache(req, self.tree_cache, checkpoint=False)
-
-        self.chunked_req = None
-        self._pending_chunked_abort_req = None
-        # A client abort leaves the message to the tokenizer.
-        finished_reason = req.discard_output_reason and reason.to_json()
-        self.send_abort_output(
-            _make_abort_req(req, finished_reason=finished_reason), req
-        )
-        logger.debug(f"Abort chunked prefill request. {req.rid=}")
+        self.output_streamer.stream_output([req], req.return_logprob)
 
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
@@ -3991,7 +4000,6 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
-        self.process_pending_chunked_abort()
         self._process_hicache_events()
 
         if self.dllm_config is not None:
@@ -4564,19 +4572,24 @@ class Scheduler(
         ]
 
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
-        """Requests whose queued result commits their last output by length."""
+        """Requests a queued result finishes: by a requested finish (after the
+        drain only queued steps carry one), or by committing their last output
+        by length."""
+        finishing = self.requested_finishes.among(batch.reqs)
         if not self.enable_skip_finishing_decode or not self.result_queue:
-            return []
+            return finishing
         # At scheduling time the overlap loop has processed every result but the last.
         assert len(self.result_queue) == 1
         queued_reqs = set(self.result_queue[0][0].reqs)
-        return [
+        finishing += [
             req
             for req in batch.reqs
             if req in queued_reqs
+            and req not in finishing
             and req.beam_group is None
             and req.next_output_finishes_by_length()
         ]
+        return finishing
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the running decoding batch in place; None skips decode this step."""
@@ -5048,11 +5061,15 @@ class Scheduler(
                 )
 
         if self.enable_unified_cache_external_linker:
-            failed = self.tree_cache.finish_external_linker_loads(batch.reqs)
-            if self.chunked_req in failed:
-                # Result processing finishes the others; a chunked one is
-                # released like a client abort so its next chunk never runs.
-                self._pending_chunked_abort_req = self.chunked_req
+            # This forward ran on KV that never landed for these requests.
+            for req in self.tree_cache.finish_external_linker_loads(batch.reqs):
+                self.requested_finishes.request(
+                    req,
+                    FINISH_ABORT(
+                        "External KV cache load failed", HTTPStatus.SERVICE_UNAVAILABLE
+                    ),
+                    drop_output=True,
+                )
 
         self._maybe_report_active_ranks()
 
@@ -5217,6 +5234,7 @@ class Scheduler(
             snapshot=snapshot,
         )
 
+        dropped_output = self._apply_requested_finishes(batch)
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
@@ -5225,7 +5243,9 @@ class Scheduler(
             elif self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.process_batch_result_disagg_prefill(batch, result)
             else:
-                self.batch_result_processor.process_batch_result_prefill(batch, result)
+                self.batch_result_processor.process_batch_result_prefill(
+                    batch, result, dropped_output=dropped_output
+                )
         elif batch.forward_mode.is_prebuilt():
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
@@ -5245,6 +5265,26 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
+
+    def _apply_requested_finishes(
+        self, batch: ScheduleBatch
+    ) -> Dict[Req, BaseFinishReason]:
+        """Hand the requested finishes of this step's requests to its commit,
+        which finishes each with its reason; returns those whose output this
+        step must not commit. The chunked request's is the drain's."""
+        dropped_output = {}
+        if not self.requested_finishes:
+            return dropped_output
+        for req in batch.reqs:
+            if req is self.chunked_req:
+                continue
+            finish = self.requested_finishes.pop(req)
+            if finish is None:
+                continue
+            req.request_finish(finish.reason)
+            if finish.drop_output:
+                dropped_output[req] = finish.reason
+        return dropped_output
 
     def _record_step_counters(
         self, batch: ScheduleBatch, result: GenerationBatchResult
@@ -5796,13 +5836,20 @@ class Scheduler(
             f"Weight version changed. {old_version=} {new_version=} {num_recorded=}"
         )
 
-    def collect_inflight_reqs(self) -> Set[Req]:
-        return {
-            req
-            for batch in self._collect_inflight_batches()
-            if batch is not None
-            for req in batch.reqs
-        }
+    def collect_inflight_reqs(self) -> List[Req]:
+        """In batch order, each once, so every rank walks them alike."""
+        return list(
+            dict.fromkeys(
+                req
+                for batch in self._collect_inflight_batches()
+                if batch is not None
+                for req in batch.reqs
+            )
+        )
+
+    def _queued_batches(self) -> List[ScheduleBatch]:
+        """The launched steps whose results the overlap loop has not processed."""
+        return [batch for batch, _ in self.result_queue]
 
     def _collect_inflight_batches(self) -> list[ScheduleBatch | None]:
         if get_parallel().pp_size == 1:
@@ -5817,9 +5864,8 @@ class Scheduler(
     def abort_request(self, recv_req: AbortReq):
         if self._deferred_responses:
             self._abort_deferred_responses(recv_req)
-        if (chunked_req := self.chunked_req) is not None:
-            if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
-                self._pending_chunked_abort_req = chunked_req
+        # The queue branches below abort these; method 3 leaves them alone.
+        taken: Set[Req] = set()
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Abort requests still waiting for encoder embeddings (EPD language-only)
@@ -5838,6 +5884,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            taken.add(req)
             self._release_aborted_request(req)
             self.beam_coordinator.retire_group(req)
             # Without the initiator's reason the tokenizer falls back to a
@@ -5869,6 +5916,7 @@ class Scheduler(
             for req in self.dllm_manager.pop_aborted_reqs(
                 recv_req.abort_all, recv_req.rid
             ):
+                taken.add(req)
                 self._release_aborted_request(req)
                 self.send_abort_output(_make_abort_req(req), req)
                 if req.kv.holds_kv or req.kv.holds_mamba:
@@ -5887,6 +5935,7 @@ class Scheduler(
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
+                    taken.add(req)
                     self._release_aborted_request(req)
 
                     if hasattr(req.disagg_kv_sender, "abort"):
@@ -5898,6 +5947,7 @@ class Scheduler(
             for req in self.disagg_prefill_inflight_queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort inflight queue request. {req.rid=}")
+                    taken.add(req)
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
@@ -5938,24 +5988,26 @@ class Scheduler(
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
-        # Delete requests in the running batch
-        for req in self.collect_inflight_reqs():
-            if not req.finished() and (
-                recv_req.abort_all or req.rid.startswith(recv_req.rid)
+        # Abort method 3: request the finish of a running or chunked request.
+        # The drain finishes it, or the commit of the step that carries it.
+        running_reqs = self.collect_inflight_reqs()
+        if self.chunked_req is not None:
+            running_reqs = [self.chunked_req, *running_reqs]
+        for req in running_reqs:
+            if (
+                req not in taken
+                and not req.finished()
+                and (recv_req.abort_all or req.rid.startswith(recv_req.rid))
             ):
-                # Abort method 3: `request_finish`
-                # The request will still run one decode forward pass.
-                # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
                 if recv_req.abort_message:
                     # Timeout aborts carry an SLA message + 503 for the client.
-                    req.request_finish(
-                        FINISH_ABORT(
-                            recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE
-                        )
+                    reason = FINISH_ABORT(
+                        recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE
                     )
                 else:
-                    req.request_finish(FINISH_ABORT())
+                    reason = FINISH_ABORT()
+                self.requested_finishes.request(req, reason)
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
@@ -6046,6 +6098,10 @@ class Scheduler(
             )
         self.running_batch.reqs = []
         for req in retract_reqs:
+            # A finish requested before the pause goes with the request to its
+            # next commit.
+            if (finish := self.requested_finishes.pop(req)) is not None:
+                req.request_finish(finish.reason)
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 if req.output_ids:
                     req.pd_rebootstrap_forced_output_id = req.output_ids.pop()

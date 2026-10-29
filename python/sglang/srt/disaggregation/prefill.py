@@ -658,7 +658,6 @@ class SchedulerDisaggregationPrefillMixin:
         last_batch: Optional[ScheduleBatch],
         should_retry_storage_prefetch: bool = True,
     ) -> NextBatchPlan:
-        self.process_pending_chunked_abort()
         self._process_hicache_events(
             should_retry_storage_prefetch=should_retry_storage_prefetch
         )
@@ -696,6 +695,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Receive requests
             self.ingest_requests()
+            self.drain_requested_finishes(uncommitted=())
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -818,6 +818,7 @@ class SchedulerDisaggregationPrefillMixin:
             received_inputs = should_ingest_requests and self.ingest_requests(
                 stop_at_pause=waiting_for_batch_result
             )
+            self.drain_requested_finishes(uncommitted=self._queued_batches())
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 self._yield_gil_if_needed()
@@ -1017,9 +1018,7 @@ class SchedulerDisaggregationPrefillMixin:
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
-                # Its KV never landed: abort instead of sending it to decode.
-                if req.discard_output_reason is not None:
-                    req.request_finish(req.discard_output_reason)
+                # Aborted, or its KV never landed: retire instead of sending it.
                 if is_aborted(req):
                     if self._retire_aborted_prefill_result(req):
                         req.time_stats.set_completion_time()

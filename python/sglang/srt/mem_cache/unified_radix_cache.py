@@ -6,7 +6,6 @@ import threading
 import time
 from array import array
 from dataclasses import replace
-from http import HTTPStatus
 from queue import Queue
 from typing import (
     TYPE_CHECKING,
@@ -3744,24 +3743,16 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def finish_external_linker_loads(self, reqs: list[Req]) -> list[Req]:
         """Wait for the external-linker loads of the batch that just ran and
-        return the requests whose KV did not land, marked so their output is
-        dropped and their KV never reaches the tree. Their slots are private
+        return the requests whose KV did not land, marked so their KV never
+        reaches the tree; the caller drops their output. Their slots are private
         (see :meth:`UnifiedCacheLinkerWrapper.load_back`), so nothing else read
         them."""
         if self.linker is None:
             return []
         failed_rids = set(self.linker.finish_loads())
         failed = [req for req in reqs if req.rid in failed_rids]
-        if failed:
-            from sglang.srt.managers.schedule_batch import FINISH_ABORT
-
-            for req in failed:
-                req.skip_radix_cache_insert = True
-                req.request_discard(
-                    FINISH_ABORT(
-                        "External KV cache load failed", HTTPStatus.SERVICE_UNAVAILABLE
-                    )
-                )
+        for req in failed:
+            req.skip_radix_cache_insert = True
         return failed
 
     def check_hicache_events(self) -> None:

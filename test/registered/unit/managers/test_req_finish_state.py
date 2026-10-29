@@ -19,11 +19,10 @@ register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 _SRT_DIR = Path(schedule_batch.__file__).resolve().parents[1]
 
-_FINISH_FIELDS = {"to_finish", "finished_reason", "discard_output_reason"}
+_FINISH_FIELDS = {"to_finish", "finished_reason"}
 _OWNER_SCOPES = {
     "Req.__init__",
     "Req.request_finish",
-    "Req.request_discard",
     "Req.clear_requested_finish",
     "Req.finish_outside_step",
     # The step commit's finish checks.
@@ -57,7 +56,6 @@ class TestReqFinishMethods(CustomTestCase):
         reason = FINISH_LENGTH(length=3)
         cases = [
             ("request_finish", (reason,), dict(to_finish=reason)),
-            ("request_discard", (reason,), dict(discard_output_reason=reason)),
             ("clear_requested_finish", (), dict(to_finish=None)),
             ("finish_outside_step", (reason,), dict(finished_reason=reason)),
         ]

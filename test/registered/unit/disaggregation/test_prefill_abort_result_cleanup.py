@@ -31,7 +31,6 @@ class _Req:
         self.disagg_kv_sender = Mock()
         self.to_finish = FINISH_ABORT() if allocated else None
         self.finished_reason = None if allocated else FINISH_ABORT()
-        self.discard_output_reason = None
         self.return_logprob = False
         self.return_sampling_mask = False
         self.grammar = None

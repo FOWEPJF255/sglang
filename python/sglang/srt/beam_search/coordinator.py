@@ -60,6 +60,7 @@ from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
     FINISH_MATCHED_TOKEN,
+    BaseFinishReason,
     Req,
     ScheduleBatch,
 )
@@ -503,6 +504,12 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         leader.finish_outside_step(reason)
         self._free_member_rows(group)
         self._retire_group(group)
+
+    def abort_group(self, leader: Req, reason: BaseFinishReason) -> None:
+        """End a running leader's group outside a commit (an abort): its
+        member rows go back and the leader finishes with ``reason``."""
+        leader.request_finish(reason)
+        self._abort_group(leader.beam_group)
 
     def retire_group(self, req: Req) -> None:
         """Leader ended outside the commit path -- retracted, or aborted while

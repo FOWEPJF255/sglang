@@ -712,7 +712,6 @@ class TestUnifiedCacheLinkerPythonBackend(
         else:
             consumer_linker.load_landed = False
             self.assertEqual(consumer.finish_external_linker_loads([req]), [req])
-            self.assertEqual(req.discard_output_reason.status_code, 503)
             self.assertTrue(req.skip_radix_cache_insert)
             release_kv_cache(req, consumer, checkpoint=False)
             self.assertFalse(req.kv.holds_kv)

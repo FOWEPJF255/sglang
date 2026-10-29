@@ -25,6 +25,9 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
+from sglang.srt.managers.scheduler_components.requested_finishes import (
+    RequestedFinishes,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -87,6 +90,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.req_to_token_pool = MagicMock()
         scheduler.hisparse_coordinator = MagicMock()
         scheduler.result_queue = deque()
+        scheduler.requested_finishes = RequestedFinishes()
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         # Support _kv_snap diagnostic logging in patched schedulers
         scheduler.token_to_kv_pool_allocator = MagicMock()

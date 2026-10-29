@@ -7,6 +7,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Dict,
     List,
     Optional,
     Tuple,
@@ -28,6 +29,7 @@ from sglang.srt.managers.auxiliary_output import CommittedTokens
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_MATCHED_TOKEN,
+    BaseFinishReason,
     Req,
     ScheduleBatch,
     mamba_lazy_spec_in_window,
@@ -311,6 +313,8 @@ class SchedulerBatchResultProcessor:
         self,
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        *,
+        dropped_output: Dict[Req, BaseFinishReason],
     ):
         skip_stream_req = None
         self.token_to_kv_pool_allocator.free_group_begin()
@@ -366,7 +370,7 @@ class SchedulerBatchResultProcessor:
                 # A reason here finishes the request without committing this
                 # forward's output: a failed KV load or an unusable sampling mask.
                 discard_finish_reason = (
-                    req.discard_output_reason if should_commit_output else None
+                    dropped_output.get(req) if should_commit_output else None
                 )
                 if (
                     should_commit_output
@@ -522,11 +526,7 @@ class SchedulerBatchResultProcessor:
                 if req.is_retracted:
                     continue
 
-                if (
-                    req.discard_output_reason is not None
-                    and req.inflight_middle_chunks <= 0
-                ):
-                    req.request_finish(req.discard_output_reason)
+                if req in dropped_output and req.inflight_middle_chunks <= 0:
                     req.update_finish_state(0)
                     release_kv_cache(req, self.tree_cache, checkpoint=False)
                     req.time_stats.set_completion_time()
@@ -1496,39 +1496,51 @@ class SchedulerBatchResultProcessor:
         if req.finished():
             if not self._mamba_can_cache_finished_req(req, result, i):
                 req.skip_radix_cache_insert = True
-
-            # isinstance narrowing: create_worker may also return plain
-            # TpModelWorker-based drafts, which carry no spec-worker hooks.
-            if isinstance(self.draft_worker, BaseSpecWorker):
-                self.draft_worker.note_request_finished(
-                    rid=req.rid,
-                    natural_stop=isinstance(req.finished_reason, FINISH_MATCHED_TOKEN),
-                )
-
-            # delete feature to save memory
-            if req.multimodal_inputs is not None and req.session is None:
-                req.multimodal_inputs.release_features()
-            self._maybe_collect_routed_experts(req)
-            self._maybe_collect_indexer_topk(req)
-
-            if get_disagg().disaggregation_decode_enable_offload_kvcache:
-                # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
-                if not self.decode_offload_manager.offload_kv_cache(req):
-                    self.decode_offload_manager.finalize_release_on_finish(req)
-            else:
-                if get_memory().enable_hisparse:
-                    self.hisparse_coordinator.request_finished(req)
-                self._prepare_kv_cache_release(req)
-                checkpoint = (
+            self.retire_finished_req(
+                req,
+                checkpoint=(
                     req.mamba_lazy_checkpoint
                     if get_exec().mamba.enable_mamba_extra_buffer_lazy
                     else True
-                )
-                release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
-
-            req.time_stats.set_completion_time()
+                ),
+            )
 
         self._maybe_collect_customized_info(i, req, logits_output, num_new_tokens)
+
+    def retire_finished_req(self, req: Req, *, checkpoint: bool) -> None:
+        """Release a finished request: the draft worker's state for it, its
+        last per-request outputs, then its media and KV (or the KV goes to the
+        decode offload). With ``checkpoint`` the tree first keeps its KV."""
+        # isinstance narrowing: create_worker may also return plain
+        # TpModelWorker-based drafts, which carry no spec-worker hooks.
+        if isinstance(self.draft_worker, BaseSpecWorker):
+            self.draft_worker.note_request_finished(
+                rid=req.rid,
+                natural_stop=isinstance(req.finished_reason, FINISH_MATCHED_TOKEN),
+            )
+
+        # delete feature to save memory
+        if req.multimodal_inputs is not None and req.session is None:
+            req.multimodal_inputs.release_features()
+        self._maybe_collect_routed_experts(req)
+        self._maybe_collect_indexer_topk(req)
+
+        if get_disagg().disaggregation_decode_enable_offload_kvcache:
+            # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
+            if not self.decode_offload_manager.offload_kv_cache(req):
+                self.decode_offload_manager.finalize_release_on_finish(req)
+        else:
+            if get_memory().enable_hisparse:
+                # A request still in host staging (aborted right after its
+                # prefill) holds staging rows instead of a device buffer.
+                if req.hisparse_staging:
+                    self.hisparse_coordinator.abort_staging_request(req)
+                else:
+                    self.hisparse_coordinator.request_finished(req)
+            self._prepare_kv_cache_release(req)
+            release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
+
+        req.time_stats.set_completion_time()
 
     def _mamba_can_cache_finished_req(
         self, req: Req, result: GenerationBatchResult, i: int
