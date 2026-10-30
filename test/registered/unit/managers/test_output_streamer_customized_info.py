@@ -1045,7 +1045,7 @@ class TestOutputStreamerDetokenizeHeader(unittest.TestCase):
         req.pd_rebootstrap_forced_output_id = None
         req.output_ids.append(9)
         streamer.stream_output([req], False)
-        self.assertEqual(list(outputs[-1].output_ids[0]), [9])
+        self.assertEqual(list(row_output_ids(outputs[-1], 0)), [9])
         self.assertEqual(outputs[-1].completion_tokens, [3])
 
     def test_skip_tokenizer_init_idle_batch_carries_an_empty_ipc_list(self):
