@@ -1508,9 +1508,7 @@ class SchedulerBatchResultProcessor:
         self._maybe_collect_customized_info(i, req, logits_output, num_new_tokens)
 
     def retire_finished_req(self, req: Req, *, checkpoint: bool) -> None:
-        """Release a finished request: the draft worker's state for it, its
-        last per-request outputs, then its media and KV (or the KV goes to the
-        decode offload). With ``checkpoint`` the tree first keeps its KV."""
+        """Release a request a commit or the drain finished."""
         # isinstance narrowing: create_worker may also return plain
         # TpModelWorker-based drafts, which carry no spec-worker hooks.
         if isinstance(self.draft_worker, BaseSpecWorker):

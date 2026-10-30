@@ -3694,6 +3694,10 @@ class Scheduler(
                 self.beam_coordinator.retire_group(candidate_req)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
+                # Finished in place, so a later abort in the same intake skips it.
+                candidate_req.finish_outside_step(
+                    FINISH_ABORT(message, HTTPStatus.SERVICE_UNAVAILABLE)
+                )
 
         self.send_abort_output(
             _make_abort_req(
@@ -3893,25 +3897,15 @@ class Scheduler(
     def drain_pending_finishes(
         self, *, uncommitted: Iterable[Optional[ScheduleBatch]]
     ) -> None:
-        """Finish each pending finish now, unless an uncommitted step carries
-        its request: that step's commit applies it. The chunked request
-        finishes now even with a chunk in flight, so no next chunk launches;
-        the in-flight chunk's commit only drains its accounting."""
-        if not self.pending_finishes:
-            return
-        carried = {
-            req for batch in uncommitted if batch is not None for req in batch.reqs
-        }
-        for req in self.pending_finishes.reqs():
-            if req.finished():
-                self.pending_finishes.pop(req)
-            elif req is self.chunked_req or req not in carried:
-                self._finish_pending(req, self.pending_finishes.pop(req))
+        """Finish the pending finishes no uncommitted step carries; the commit
+        of a carrying step applies the rest."""
+        for req, finish in self.pending_finishes.take_uncarried(
+            uncommitted=uncommitted, chunked_req=self.chunked_req
+        ):
+            self._finish_pending(req, finish)
 
     def _finish_pending(self, req: Req, finish: PendingFinish) -> None:
-        """Finish a request no uncommitted step carries: release what it holds
-        as a commit releases a request it finishes, then stream its last
-        output."""
+        """Release what req holds and stream its last output."""
         if req is self.chunked_req:
             # Mid-prefill: the attempt ends and its partial KV is not cached.
             self.chunked_req = None
@@ -3919,6 +3913,8 @@ class Scheduler(
             prepare_abort(req, reason.message, reason.status_code)
             req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
             self._release_aborted_request(req)
+            # No member rows exist before the leader's prefill ends.
+            self.beam_coordinator.retire_group(req)
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.release_aborted_prefill_waiting_req(req)
             else:
@@ -5283,18 +5279,12 @@ class Scheduler(
     def _apply_pending_finishes(
         self, batch: ScheduleBatch
     ) -> Dict[Req, BaseFinishReason]:
-        """Hand the pending finishes of this step's requests to its commit,
-        which finishes each with its reason; returns those whose output this
-        step must not commit. The chunked request's is the drain's."""
+        """Returns the requests whose output this step must not commit; the
+        chunked request's finish belongs to the drain."""
         dropped_output = {}
-        if not self.pending_finishes:
-            return dropped_output
-        for req in batch.reqs:
-            if req is self.chunked_req:
-                continue
-            finish = self.pending_finishes.pop(req)
-            if finish is None:
-                continue
+        for req, finish in self.pending_finishes.take_for_commit(
+            batch.reqs, chunked_req=self.chunked_req
+        ):
             req.request_finish(finish.reason)
             if finish.drop_output:
                 dropped_output[req] = finish.reason
@@ -5494,6 +5484,10 @@ class Scheduler(
 
             # tree cache sanity check
             self.invariant_checker._check_tree_cache()
+            # Only an uncommitted step keeps a pending finish past the drain.
+            assert not self.pending_finishes, (
+                f"pending finishes when idle: {[r.rid for r in self.pending_finishes.reqs()]}"
+            )
 
         # metrics every 30s
         self.metrics_reporter._maybe_log_idle_metrics()
@@ -5862,7 +5856,7 @@ class Scheduler(
         )
 
     def _queued_batches(self) -> List[ScheduleBatch]:
-        """The launched steps whose results the overlap loop has not processed."""
+        """The launched steps whose results the overlap loops have not processed."""
         return [batch for batch, _ in self.result_queue]
 
     def _collect_inflight_batches(self) -> list[ScheduleBatch | None]:
@@ -5878,7 +5872,8 @@ class Scheduler(
     def abort_request(self, recv_req: AbortReq):
         if self._deferred_responses:
             self._abort_deferred_responses(recv_req)
-        # The queue branches below abort these; method 3 leaves them alone.
+        # A PD prefill queue keeps the requests it aborts until their sender
+        # concludes; method 3 leaves those to it.
         taken: Set[Req] = set()
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
@@ -5898,7 +5893,9 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
-            taken.add(req)
+            # Finished in place, so a later abort in the same intake skips it.
+            if req.finished_reason is None:
+                req.finish_outside_step(FINISH_ABORT())
             self._release_aborted_request(req)
             self.beam_coordinator.retire_group(req)
             # Without the initiator's reason the tokenizer falls back to a
@@ -5912,8 +5909,6 @@ class Scheduler(
                     discard_kv_cache_backup(req, self.tree_cache, "host_pool")
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                if req.finished_reason is None:
-                    req.finish_outside_step(FINISH_ABORT())
                 release_kv_cache(req, self.tree_cache, checkpoint=True)
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.release_aborted_prefill_waiting_req(req)
@@ -5930,7 +5925,9 @@ class Scheduler(
             for req in self.dllm_manager.pop_aborted_reqs(
                 recv_req.abort_all, recv_req.rid
             ):
-                taken.add(req)
+                # Finished in place, so a later abort in the same intake skips it.
+                if req.finished_reason is None:
+                    req.finish_outside_step(FINISH_ABORT())
                 self._release_aborted_request(req)
                 self.send_abort_output(_make_abort_req(req), req)
                 if req.kv.holds_kv or req.kv.holds_mamba:

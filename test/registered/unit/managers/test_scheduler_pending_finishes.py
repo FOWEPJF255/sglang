@@ -44,6 +44,7 @@ class _FakeReq:
         self.to_finish = None
         self.finished_reason = None
         self.beam_group = None
+        self.inflight_middle_chunks = 0
         self.return_logprob = False
         self.output_ids = []
         self.weight_version_events = []
@@ -104,25 +105,56 @@ class TestPendingFinishes(CustomTestCase):
         self.assertEqual(finishes.reqs(), [req])
         self.assertEqual(finishes.pop(req), PendingFinish(abort, True))
 
-    def test_drain_finishes_only_requests_no_uncommitted_step_carries(self):
+    def test_drain_takes_what_no_uncommitted_step_carries(self):
+        carried, idle, chunked, gone = (_FakeReq(rid) for rid in "abcd")
+        finishes = PendingFinishes()
+        for req in (carried, idle, chunked, gone):
+            finishes.add(req, FINISH_ABORT())
+        gone.finished_reason = FINISH_LENGTH(length=1)
+
+        # The chunked request goes even though its middle chunk is in flight.
+        taken = finishes.take_uncarried(
+            uncommitted=[_batch(carried, chunked), None], chunked_req=chunked
+        )
+
+        self.assertEqual([req for req, _ in taken], [idle, chunked])
+        self.assertEqual(finishes.reqs(), [carried])
+
+    def test_commit_takes_its_requests_and_never_a_drained_one(self):
+        kept, chunked, drained = (_FakeReq(rid) for rid in "abc")
+        finishes = PendingFinishes()
+        for req in (kept, chunked, drained):
+            finishes.add(req, FINISH_ABORT())
+        finishes.take_uncarried(uncommitted=[_batch(kept, chunked)], chunked_req=None)
+
+        taken = finishes.take_for_commit([kept, chunked], chunked_req=chunked)
+
+        # The drain owns the chunked request: its next chunk must not launch.
+        self.assertEqual([req for req, _ in taken], [kept])
+        self.assertEqual(finishes.reqs(), [chunked])
+        with self.assertRaises(AssertionError):
+            finishes.take_for_commit([drained], chunked_req=None)
+        # A drained chunked request's in-flight middle chunk still commits.
+        drained.inflight_middle_chunks = 1
+        finishes.take_for_commit([drained], chunked_req=None)
+
+
+class TestSchedulerPendingFinishes(CustomTestCase):
+    def test_drain_releases_a_running_request(self):
         # No step result says whether a mamba tree could cache the state.
         for supports_mamba, checkpoint in ((False, True), (True, False)):
             with self.subTest(supports_mamba=supports_mamba):
-                carried, idle = _FakeReq("carried"), _FakeReq("idle")
-                reason = FINISH_ABORT()
+                req, reason = _FakeReq("running"), FINISH_ABORT()
                 s = _scheduler()
                 s.tree_cache = SimpleNamespace(supports_mamba=lambda: supports_mamba)
-                s.pending_finishes.add(carried, reason)
-                s.pending_finishes.add(idle, reason)
+                s.pending_finishes.add(req, reason)
 
-                s.drain_pending_finishes(uncommitted=[_batch(carried), None])
+                s.drain_pending_finishes(uncommitted=())
 
-                self.assertIs(idle.finished_reason, reason)
+                self.assertIs(req.finished_reason, reason)
                 retire = s.batch_result_processor.retire_finished_req
-                retire.assert_called_once_with(idle, checkpoint=checkpoint)
-                s.output_streamer.stream_output.assert_called_once_with([idle], False)
-                self.assertIsNone(carried.finished_reason)
-                self.assertEqual(s.pending_finishes.reqs(), [carried])
+                retire.assert_called_once_with(req, checkpoint=checkpoint)
+                s.output_streamer.stream_output.assert_called_once_with([req], False)
 
     def test_chunked_request_finishes_at_the_drain_with_its_reason(self):
         req = _FakeReq("chunked")
@@ -131,32 +163,28 @@ class TestPendingFinishes(CustomTestCase):
             req, FINISH_ABORT("External KV cache load failed", 503), drop_output=True
         )
 
-        # Its middle chunk is still in flight; the next chunk must not launch.
         with patch("sglang.srt.managers.scheduler.release_kv_cache") as release:
             s.drain_pending_finishes(uncommitted=[_batch(req)])
 
         self.assertIsNone(s.chunked_req)
         self.assertEqual(req.finished_reason.status_code, 503)
         release.assert_called_once_with(req, s.tree_cache, checkpoint=False)
+        # A beam leader aborted mid-prefill retires its group.
+        s.beam_coordinator.retire_group.assert_called_once_with(req)
         s.output_streamer.stream_output.assert_called_once_with([req], False)
-        self.assertFalse(s.pending_finishes)
 
-    def test_commit_applies_the_finishes_of_the_requests_it_carries(self):
-        kept, dropped, chunked, other = (_FakeReq(rid) for rid in "abcd")
+    def test_commit_hands_finishes_to_to_finish(self):
+        kept, dropped = _FakeReq("kept"), _FakeReq("dropped")
         abort, failed = FINISH_ABORT(), FINISH_ABORT("load failed", 503)
-        s = _scheduler(chunked_req=chunked)
-        for req in (kept, chunked, other):
-            s.pending_finishes.add(req, abort)
+        s = _scheduler()
+        s.pending_finishes.add(kept, abort)
         s.pending_finishes.add(dropped, failed, drop_output=True)
 
-        dropped_output = s._apply_pending_finishes(_batch(kept, dropped, chunked))
+        dropped_output = s._apply_pending_finishes(_batch(kept, dropped))
 
         self.assertEqual(dropped_output, {dropped: failed})
         self.assertIs(kept.to_finish, abort)
         self.assertIs(dropped.to_finish, failed)
-        # The drain owns the chunked request: its next chunk must not launch.
-        self.assertIsNone(chunked.to_finish)
-        self.assertEqual(s.pending_finishes.reqs(), [chunked, other])
 
     def test_preemption_never_sees_a_request_with_a_pending_finish(self):
         staged, running = _FakeReq("staged"), _FakeReq("running")
@@ -199,6 +227,42 @@ class TestPendingFinishes(CustomTestCase):
         # Scheduling already left it out of the running batch.
         self.assertEqual(s._reqs_finishing_inflight(_batch(running)), [staged])
 
+    def test_run_batch_records_a_failed_external_load(self):
+        req = _FakeReq("loaded")
+        s = _scheduler()
+        s.scheduler_stage_metrics = None
+        s.metrics_reporter = Mock()
+        s.forward_ct = 0
+        s._sched_idled = False
+        s.processed_tokens_counter = 0
+        s.scripted_scheduler_hook = None
+        s.profiler_manager = Mock()
+        s.forward_sleep_time = None
+        s.is_generation = False
+        s.enable_overlap = False
+        s.future_map = None
+        s.attn_dp_enabled = False
+        s.tp_worker = Mock()
+        s.tp_worker.forward_batch_embedding.return_value = (
+            SimpleNamespace(embeddings=None, pooled_hidden_states=None),
+            False,
+        )
+        s.enable_unified_cache_external_linker = True
+        s.tree_cache = Mock()
+        s.tree_cache.finish_external_linker_loads.return_value = [req]
+        mode = SimpleNamespace(
+            is_split_prefill=lambda: False, is_prebuilt=lambda: False
+        )
+        batch = SimpleNamespace(reqs=[req], forward_mode=mode, extend_num_tokens=0)
+
+        with patch("sglang.srt.managers.scheduler.resolve_forward_inputs"):
+            s.run_batch(batch)
+
+        finish = s.pending_finishes.pop(req)
+        self.assertTrue(finish.drop_output)
+        self.assertIsInstance(finish.reason, FINISH_ABORT)
+        self.assertEqual(finish.reason.status_code, 503)
+
 
 class TestAbortRunningRequest(CustomTestCase):
     def setUp(self):
@@ -223,14 +287,21 @@ class TestAbortRunningRequest(CustomTestCase):
             "sglang.srt.managers.scheduler.get_serving",
             return_value=SimpleNamespace(weight_version="v0"),
         ):
-            s.abort_request(
-                SimpleNamespace(
-                    abort_all=True, rid="", abort_message=None, finished_reason=None
+            # Two aborts in one intake: a client abort, then an abort_all.
+            for rid, abort_all in (("requeued", False), ("", True)):
+                s.abort_request(
+                    SimpleNamespace(
+                        abort_all=abort_all,
+                        rid=rid,
+                        abort_message=None,
+                        finished_reason=None,
+                    )
                 )
-            )
 
         self.assertEqual(s.waiting_queue, [])
         self.assertEqual(s.pending_finishes.reqs(), [running])
+        s._release_aborted_request.assert_called_once_with(requeued)
+        self.assertEqual(s.ipc_channels.send_to_tokenizer.send_output.call_count, 1)
 
 
 if __name__ == "__main__":
