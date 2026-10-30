@@ -3928,8 +3928,12 @@ class Scheduler(
                 self.beam_coordinator.abort_group(req, finish.reason)
             else:
                 req.finish_outside_step(finish.reason)
+            # With no step result, nothing tells whether a mamba tree could
+            # cache the state (_mamba_can_cache_finished_req): it keeps none.
             self.batch_result_processor.retire_finished_req(
-                req, checkpoint=not finish.drop_output
+                req,
+                checkpoint=not finish.drop_output
+                and not self.tree_cache.supports_mamba(),
             )
         self.output_streamer.stream_output([req], req.return_logprob)
 
@@ -4067,8 +4071,12 @@ class Scheduler(
 
         # Every step, not only after a merge: overlap merges a prefill's requests
         # before its result finishes them, and update_running_batch may never run.
+        # A request with a requested finish leaves here too, before preemption,
+        # mixed chunk or retract can pick it.
         running_bs = running_batch.batch_size()
-        running_batch.filter_batch()
+        running_batch.filter_batch(
+            reqs_to_exclude=self.requested_finishes.among(running_batch.reqs)
+        )
         if running_batch.batch_size() < running_bs:
             running_batch.batch_is_full = False
 
@@ -4572,10 +4580,12 @@ class Scheduler(
         ]
 
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
-        """Requests a queued result finishes: by a requested finish (after the
-        drain only queued steps carry one), or by committing their last output
-        by length."""
-        finishing = self.requested_finishes.among(batch.reqs)
+        """Requests a queued result finishes: those with a requested finish it
+        carries, whether or not scheduling already left them out of batch, and
+        those of batch committing their last output by length."""
+        finishing = self.requested_finishes.among(
+            req for queued in self._queued_batches() for req in queued.reqs
+        )
         if not self.enable_skip_finishing_decode or not self.result_queue:
             return finishing
         # At scheduling time the overlap loop has processed every result but the last.
@@ -5236,6 +5246,10 @@ class Scheduler(
 
         dropped_output = self._apply_requested_finishes(batch)
         if batch.forward_mode.is_decode():
+            # Only a prefill step reports a failed KV load.
+            assert not dropped_output, (
+                f"decode step drops output of {[req.rid for req in dropped_output]}"
+            )
             self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():

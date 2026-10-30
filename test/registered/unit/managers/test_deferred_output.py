@@ -15,6 +15,9 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
+from sglang.srt.managers.scheduler_components.requested_finishes import (
+    RequestedFinishes,
+)
 from sglang.srt.runtime_context import get_serving
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils.weight_versions import (
@@ -220,6 +223,10 @@ def test_held_responses_do_not_change_idle_state():
 def test_scheduler_polls_until_a_held_response_completes(state):
     scheduler = MagicMock()
     scheduler._deferred_responses = None
+    scheduler.requested_finishes = RequestedFinishes()
+    scheduler._apply_requested_finishes = lambda batch: (
+        Scheduler._apply_requested_finishes(scheduler, batch)
+    )
     scheduler.output_streamer = _scheduler().output_streamer
     scheduler.stream_released_deferred_outputs = lambda: (
         Scheduler.stream_released_deferred_outputs(scheduler)

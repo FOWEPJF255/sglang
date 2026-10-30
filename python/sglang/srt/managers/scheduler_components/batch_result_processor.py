@@ -1532,9 +1532,11 @@ class SchedulerBatchResultProcessor:
         else:
             if get_memory().enable_hisparse:
                 # A request still in host staging (aborted right after its
-                # prefill) holds staging rows instead of a device buffer.
+                # prefill) holds staging rows instead of a device buffer, and
+                # its KV goes without an insert, as a retraction releases it.
                 if req.hisparse_staging:
                     self.hisparse_coordinator.abort_staging_request(req)
+                    checkpoint = False
                 else:
                     self.hisparse_coordinator.request_finished(req)
             self._prepare_kv_cache_release(req)

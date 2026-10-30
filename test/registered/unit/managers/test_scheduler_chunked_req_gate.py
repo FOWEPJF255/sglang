@@ -13,6 +13,9 @@ maybe_stub_sgl_kernel()
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.requested_finishes import (
+    RequestedFinishes,
+)
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -94,6 +97,7 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     tree_cache.check_hicache_events = MagicMock()
     s.tree_cache = tree_cache
     s.chunked_req = chunked_req
+    s.requested_finishes = RequestedFinishes()
     return s
 
 

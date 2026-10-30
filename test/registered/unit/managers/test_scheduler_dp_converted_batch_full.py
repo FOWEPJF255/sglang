@@ -12,6 +12,9 @@ maybe_stub_sgl_kernel()
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import NextBatchPlan
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.requested_finishes import (
+    RequestedFinishes,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -54,6 +57,7 @@ class TestDpConvertedBatchFull(unittest.TestCase):
         s.enable_fpm = False
         s.dllm_config = None
         s.chunked_req = None
+        s.requested_finishes = RequestedFinishes()
         s.enable_hisparse = False
         s.require_mlp_sync = False
         s._should_defer_prefill = Mock(return_value=False)

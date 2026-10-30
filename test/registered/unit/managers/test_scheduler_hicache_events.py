@@ -27,6 +27,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         self.calls = Mock()
         self.scheduler = s = Scheduler.__new__(Scheduler)
         s.scheduler_stage_metrics = None
+        s.requested_finishes = RequestedFinishes()
         s.enable_hierarchical_cache = True
         s.enable_unified_cache_external_linker = False
         s.enable_lmcache = False
@@ -37,11 +38,12 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.dp_attn_adapter = Mock()
         s.dp_attn_adapter.maybe_prepare_mlp_sync_batch.return_value = None
         self.running_batch = SimpleNamespace(
+            reqs=[],
             batch_is_full=False,
             is_prefill_only=False,
             is_empty=lambda: True,
             batch_size=lambda: 0,
-            filter_batch=lambda: None,
+            filter_batch=lambda reqs_to_exclude=None: None,
         )
 
     def test_pd_prefill_drains_before_admission_even_with_empty_queue(self):
@@ -105,7 +107,6 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.last_mbs = [None]
         s.mbs = [None]
         s.mb_metadata = [None]
-        s.requested_finishes = RequestedFinishes()
         s.ingest_requests = Mock(return_value=[])
         s.waiting_queue = []
         s.disagg_prefill_bootstrap_queue = SimpleNamespace(pop_bootstrapped=lambda: [])
