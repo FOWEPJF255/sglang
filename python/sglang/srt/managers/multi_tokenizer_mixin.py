@@ -200,9 +200,6 @@ def _handle_output_by_index(output, i):
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             **_extract_output_ids_by_indices(output, [i]),
             detokenize_headers=_extract_field_by_index(output, "detokenize_headers", i),
-            finished_http_worker_ipcs=_extract_field_by_index(
-                output, "finished_http_worker_ipcs", i
-            ),
             completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
             reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
             request_stats=_extract_field_by_index(output, "request_stats", i),
@@ -716,9 +713,9 @@ class MultiDetokenizerRouter:
     """Route scheduler outputs to one of N DetokenizerManager workers.
 
     Each request is pinned to a worker by hashing its ``rid`` with ``zlib.crc32``
-    (deterministic across runs), so all outputs of the same rid always land on
-    the same detokenizer and ``detokenize_state_table`` stays consistent. Only the first
-    and the finished output of a request carry its ``http_worker_ipc``.
+    (deterministic across runs), so all outputs of a rid land on the same
+    detokenizer and ``detokenize_state_table`` stays consistent. The route cannot
+    be the key: only some outputs of a request carry its ``http_worker_ipc``.
     """
 
     def __init__(self, ipc_name_list: List[str], port_args: PortArgs):

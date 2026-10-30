@@ -402,7 +402,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
         own route must survive the split to its detokenizer."""
         output = _make_batch_token_id_output()
         output.finished_reasons = [None, {"type": "length"}]
-        output.finished_http_worker_ipcs = [None, "worker-b"]
+        output.http_worker_ipcs = [None, "worker-b"]
         header = DetokenizeHeader(
             prompt_tail_ids=array("q", [1, 2]),
             skip_special_tokens=True,
@@ -419,7 +419,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
 
         self.assertEqual(
             [
-                (target, obj.detokenize_headers, obj.finished_http_worker_ipcs)
+                (target, obj.detokenize_headers, obj.http_worker_ipcs)
                 for target, obj in sent
             ],
             [("detok-a", [header], [None]), ("detok-b", [None], ["worker-b"])],
@@ -501,7 +501,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
                 "sglang.srt.managers.multi_tokenizer_mixin.sock_recv",
                 side_effect=[
                     ConfigureLoggingReq(log_level="debug"),
-                    AbortReq(rid="rid-0"),
+                    AbortReq(rid="rid-0", http_worker_ipc="worker-a"),
                     EOFError("end of input"),
                 ],
             ),
