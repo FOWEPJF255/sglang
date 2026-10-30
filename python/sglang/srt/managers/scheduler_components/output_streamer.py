@@ -252,6 +252,10 @@ class SchedulerOutputStreamer:
                 # With the overlap schedule, a request will try to output twice and hit this line twice
                 # because of the one additional delayed token. This "continue" prevented the dummy output.
                 continue
+            if req.pd_rebootstrap_forced_output_id is not None and not req.finished():
+                # A PD rebootstrap popped the last output id, which the client already
+                # has, and replays it; nothing is new until the replay re-adds it.
+                continue
 
             acc.accept(req=req)
             self._maybe_log_time_stats(req=req)
@@ -443,6 +447,10 @@ class _GenerationStreamAccumulator:
     decode_latencies: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if self.output_sink is OutputSink.TOKENIZER:
+            # The tokenizer-side router reads this list on every batch, idle
+            # ones included.
+            self.has_http_worker_ipc = True
         if self.output_sink is OutputSink.RUST:
             self.prompt_tokens = []
             self.cached_tokens = []
@@ -552,7 +560,6 @@ class _GenerationStreamAccumulator:
             self.has_http_worker_ipc = self.has_http_worker_ipc or ipc is not None
         elif self.output_sink is OutputSink.TOKENIZER:
             self.http_worker_ipcs.append(req.http_worker_ipc)
-            self.has_http_worker_ipc = True
 
         if self.output_sink is OutputSink.RUST:
             # Per-step header columns of `push_generation`.
