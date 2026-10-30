@@ -54,8 +54,8 @@ if _HAS_MLX:
     from sglang.srt.managers.scheduler_components.batch_result_processor import (
         SchedulerBatchResultProcessor,
     )
-    from sglang.srt.managers.scheduler_components.requested_finishes import (
-        RequestedFinishes,
+    from sglang.srt.managers.scheduler_components.pending_finishes import (
+        PendingFinishes,
     )
     from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams, InsertResult
@@ -1165,9 +1165,9 @@ class TestMlxOverlapScheduler(unittest.TestCase):
 
         scheduler = SchedulerMlxOverlapMixin.__new__(SchedulerMlxOverlapMixin)
         scheduler.ingest_requests = lambda: []
-        scheduler.requested_finishes = RequestedFinishes()
-        scheduler.drain_requested_finishes = MethodType(
-            Scheduler.drain_requested_finishes, scheduler
+        scheduler.pending_finishes = PendingFinishes()
+        scheduler.drain_pending_finishes = MethodType(
+            Scheduler.drain_pending_finishes, scheduler
         )
         scheduler.gracefully_exit = False
         scheduler._engine_paused = False

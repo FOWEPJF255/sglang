@@ -115,7 +115,7 @@ class SchedulerMultiplexMixin:
             with torch.cuda.stream(decode_stream):
                 self.ingest_requests()
                 # The split prefill spans iterations until its result is processed.
-                self.drain_requested_finishes(uncommitted=[self.split_prefill_batch])
+                self.drain_pending_finishes(uncommitted=[self.split_prefill_batch])
                 running_batch = self.running_batch
 
             with torch.cuda.stream(prefill_stream), pdmux_prefill_tp_group():

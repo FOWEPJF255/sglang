@@ -15,8 +15,8 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import NextBatchPlan
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.requested_finishes import (
-    RequestedFinishes,
+from sglang.srt.managers.scheduler_components.pending_finishes import (
+    PendingFinishes,
 )
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -27,7 +27,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         self.calls = Mock()
         self.scheduler = s = Scheduler.__new__(Scheduler)
         s.scheduler_stage_metrics = None
-        s.requested_finishes = RequestedFinishes()
+        s.pending_finishes = PendingFinishes()
         s.enable_hierarchical_cache = True
         s.enable_unified_cache_external_linker = False
         s.enable_lmcache = False

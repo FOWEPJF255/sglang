@@ -110,12 +110,12 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
         from sglang.srt.hardware_backend.mlx.scheduler_mixin import (
             SchedulerMlxOverlapMixin,
         )
-        from sglang.srt.managers.scheduler_components.requested_finishes import (
-            RequestedFinishes,
+        from sglang.srt.managers.scheduler_components.pending_finishes import (
+            PendingFinishes,
         )
 
         scheduler = MagicMock()
-        scheduler.requested_finishes = RequestedFinishes()
+        scheduler.pending_finishes = PendingFinishes()
         scheduler.forward_ct = 0
         scheduler._sched_idled = False
         scheduler._prepare_mlx_launch.side_effect = lambda batch: (

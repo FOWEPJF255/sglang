@@ -26,8 +26,8 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.requested_finishes import (
-    RequestedFinishes,
+from sglang.srt.managers.scheduler_components.pending_finishes import (
+    PendingFinishes,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -74,7 +74,7 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s = Scheduler.__new__(Scheduler)
     s.enable_continuous_input_polling = False
     s.result_queue = deque()
-    s.requested_finishes = RequestedFinishes()
+    s.pending_finishes = PendingFinishes()
     s.waiting_queue = waiting_queue
     s.enable_hierarchical_cache = False
     s.enable_hicache_storage = False
@@ -160,7 +160,7 @@ class TestRunningTimeout(CustomTestCase):
 
         self.assertEqual([a.rid for a in aborts], ["stale"])
         # abort_request() requests the finish on every rank, not the poll.
-        self.assertFalse(s.requested_finishes)
+        self.assertFalse(s.pending_finishes)
 
     def test_req_in_both_running_and_last_batch_is_emitted_once(self):
         stale = _req("stale", forward_entry=time.perf_counter() - 10)
@@ -187,7 +187,7 @@ class TestRunningTimeout(CustomTestCase):
             self.assertEqual([abort.rid for abort in aborts], ["stale"])
             # The broadcast abort is requested before the GPU result arrives.
             s.abort_request(aborts[0])
-            self.assertEqual(s.requested_finishes.reqs(), [stale])
+            self.assertEqual(s.pending_finishes.reqs(), [stale])
             self.assertFalse(stale.finished())
             for _ in range(3):
                 self.assertEqual(s._poll_timeout_aborts(), [])

@@ -1585,7 +1585,7 @@ def is_unadmitted_reject(req: Req) -> bool:
     """A request rejected at intake, before it acquired anything.
 
     A preempted or resumed request can also carry a pending abort -- a
-    requested finish handed to `to_finish` by a commit that skipped it, or by
+    pending finish handed to `to_finish` by a commit that skipped it, or by
     a pause, while `finished()` is still False -- and its queue owns the
     release of whatever it still holds.
 

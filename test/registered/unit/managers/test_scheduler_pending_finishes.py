@@ -24,9 +24,9 @@ from sglang.srt.managers.schedule_batch import (  # noqa: E402
     Req,
 )
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
-from sglang.srt.managers.scheduler_components.requested_finishes import (  # noqa: E402
-    RequestedFinish,
-    RequestedFinishes,
+from sglang.srt.managers.scheduler_components.pending_finishes import (  # noqa: E402
+    PendingFinish,
+    PendingFinishes,
 )
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -75,7 +75,7 @@ class _RunningBatch:
 
 def _scheduler(*, chunked_req=None) -> Scheduler:
     s = Scheduler.__new__(Scheduler)
-    s.requested_finishes = RequestedFinishes()
+    s.pending_finishes = PendingFinishes()
     s.chunked_req = chunked_req
     s.disaggregation_mode = DisaggregationMode.NULL
     s.batch_result_processor = Mock()
@@ -89,20 +89,20 @@ def _scheduler(*, chunked_req=None) -> Scheduler:
     return s
 
 
-class TestRequestedFinishes(CustomTestCase):
+class TestPendingFinishes(CustomTestCase):
     def test_first_reason_wins_and_any_request_drops_the_output(self):
         req, done = _FakeReq("r"), _FakeReq("done")
         done.finished_reason = FINISH_LENGTH(length=1)
         abort, failed = FINISH_ABORT("client"), FINISH_ABORT("load failed", 503)
-        finishes = RequestedFinishes()
+        finishes = PendingFinishes()
 
-        finishes.request(req, abort)
-        finishes.request(req, failed, drop_output=True)
-        finishes.request(req, failed)
-        finishes.request(done, abort)
+        finishes.add(req, abort)
+        finishes.add(req, failed, drop_output=True)
+        finishes.add(req, failed)
+        finishes.add(done, abort)
 
         self.assertEqual(finishes.reqs(), [req])
-        self.assertEqual(finishes.pop(req), RequestedFinish(abort, True))
+        self.assertEqual(finishes.pop(req), PendingFinish(abort, True))
 
     def test_drain_finishes_only_requests_no_uncommitted_step_carries(self):
         # No step result says whether a mamba tree could cache the state.
@@ -112,56 +112,56 @@ class TestRequestedFinishes(CustomTestCase):
                 reason = FINISH_ABORT()
                 s = _scheduler()
                 s.tree_cache = SimpleNamespace(supports_mamba=lambda: supports_mamba)
-                s.requested_finishes.request(carried, reason)
-                s.requested_finishes.request(idle, reason)
+                s.pending_finishes.add(carried, reason)
+                s.pending_finishes.add(idle, reason)
 
-                s.drain_requested_finishes(uncommitted=[_batch(carried), None])
+                s.drain_pending_finishes(uncommitted=[_batch(carried), None])
 
                 self.assertIs(idle.finished_reason, reason)
                 retire = s.batch_result_processor.retire_finished_req
                 retire.assert_called_once_with(idle, checkpoint=checkpoint)
                 s.output_streamer.stream_output.assert_called_once_with([idle], False)
                 self.assertIsNone(carried.finished_reason)
-                self.assertEqual(s.requested_finishes.reqs(), [carried])
+                self.assertEqual(s.pending_finishes.reqs(), [carried])
 
     def test_chunked_request_finishes_at_the_drain_with_its_reason(self):
         req = _FakeReq("chunked")
         s = _scheduler(chunked_req=req)
-        s.requested_finishes.request(
+        s.pending_finishes.add(
             req, FINISH_ABORT("External KV cache load failed", 503), drop_output=True
         )
 
         # Its middle chunk is still in flight; the next chunk must not launch.
         with patch("sglang.srt.managers.scheduler.release_kv_cache") as release:
-            s.drain_requested_finishes(uncommitted=[_batch(req)])
+            s.drain_pending_finishes(uncommitted=[_batch(req)])
 
         self.assertIsNone(s.chunked_req)
         self.assertEqual(req.finished_reason.status_code, 503)
         release.assert_called_once_with(req, s.tree_cache, checkpoint=False)
         s.output_streamer.stream_output.assert_called_once_with([req], False)
-        self.assertFalse(s.requested_finishes)
+        self.assertFalse(s.pending_finishes)
 
     def test_commit_applies_the_finishes_of_the_requests_it_carries(self):
         kept, dropped, chunked, other = (_FakeReq(rid) for rid in "abcd")
         abort, failed = FINISH_ABORT(), FINISH_ABORT("load failed", 503)
         s = _scheduler(chunked_req=chunked)
         for req in (kept, chunked, other):
-            s.requested_finishes.request(req, abort)
-        s.requested_finishes.request(dropped, failed, drop_output=True)
+            s.pending_finishes.add(req, abort)
+        s.pending_finishes.add(dropped, failed, drop_output=True)
 
-        dropped_output = s._apply_requested_finishes(_batch(kept, dropped, chunked))
+        dropped_output = s._apply_pending_finishes(_batch(kept, dropped, chunked))
 
         self.assertEqual(dropped_output, {dropped: failed})
         self.assertIs(kept.to_finish, abort)
         self.assertIs(dropped.to_finish, failed)
         # The drain owns the chunked request: its next chunk must not launch.
         self.assertIsNone(chunked.to_finish)
-        self.assertEqual(s.requested_finishes.reqs(), [chunked, other])
+        self.assertEqual(s.pending_finishes.reqs(), [chunked, other])
 
-    def test_preemption_never_sees_a_request_with_a_requested_finish(self):
+    def test_preemption_never_sees_a_request_with_a_pending_finish(self):
         staged, running = _FakeReq("staged"), _FakeReq("running")
         s = _scheduler()
-        s.requested_finishes.request(staged, FINISH_ABORT())
+        s.pending_finishes.add(staged, FINISH_ABORT())
         s.scheduler_stage_metrics = None
         s._process_hicache_events = Mock()
         s.dllm_config = None
@@ -193,7 +193,7 @@ class TestRequestedFinishes(CustomTestCase):
     def test_a_carried_request_still_counts_as_finishing_in_flight(self):
         staged, running = _FakeReq("staged"), _FakeReq("running")
         s = _scheduler()
-        s.requested_finishes.request(staged, FINISH_ABORT())
+        s.pending_finishes.add(staged, FINISH_ABORT())
         s.result_queue = deque([(_batch(running, staged), None)])
 
         # Scheduling already left it out of the running batch.
@@ -230,7 +230,7 @@ class TestAbortRunningRequest(CustomTestCase):
             )
 
         self.assertEqual(s.waiting_queue, [])
-        self.assertEqual(s.requested_finishes.reqs(), [running])
+        self.assertEqual(s.pending_finishes.reqs(), [running])
 
 
 if __name__ == "__main__":

@@ -1279,7 +1279,7 @@ class Req(ReqDllmMixin):
         # Owned by Scheduler.defer_response until its completion is retired.
         self.defer_output = False
         # A finish the request's next commit applies. A finish decided while
-        # it runs goes through Scheduler.requested_finishes instead.
+        # it runs goes through Scheduler.pending_finishes instead.
         self.to_finish: Optional[BaseFinishReason] = None
         self.stream = stream
         self.eos_token_ids = eos_token_ids

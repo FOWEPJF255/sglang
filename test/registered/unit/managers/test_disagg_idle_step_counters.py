@@ -21,8 +21,8 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.requested_finishes import (
-    RequestedFinishes,
+from sglang.srt.managers.scheduler_components.pending_finishes import (
+    PendingFinishes,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -624,7 +624,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.running_batch = ScheduleBatch(reqs=[])
         scheduler.last_batch = None
         scheduler.chunked_req = None
-        scheduler.requested_finishes = RequestedFinishes()
+        scheduler.pending_finishes = PendingFinishes()
         scheduler.waiting_queue = []
         scheduler.disagg_prefill_inflight_queue = []
         scheduler.enable_staging = False

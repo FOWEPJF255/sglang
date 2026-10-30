@@ -283,6 +283,10 @@ from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
+from sglang.srt.managers.scheduler_components.pending_finishes import (
+    PendingFinish,
+    PendingFinishes,
+)
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
@@ -294,10 +298,6 @@ from sglang.srt.managers.scheduler_components.recv_skipper import (
 )
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
-)
-from sglang.srt.managers.scheduler_components.requested_finishes import (
-    RequestedFinish,
-    RequestedFinishes,
 )
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
@@ -1361,7 +1361,7 @@ class Scheduler(
         self.result_queue: deque[
             tuple[ScheduleBatch, GenerationBatchResult | EmbeddingBatchResult]
         ] = deque()
-        self.requested_finishes = RequestedFinishes()
+        self.pending_finishes = PendingFinishes()
         self.enable_continuous_input_polling = False
         self.enable_skip_finishing_decode = False
         self.forward_ct = 0
@@ -2061,7 +2061,7 @@ class Scheduler(
 
             # Receive requests
             self.ingest_requests()
-            self.drain_requested_finishes(uncommitted=())
+            self.drain_pending_finishes(uncommitted=())
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -2107,7 +2107,7 @@ class Scheduler(
 
             # Receive requests
             self.ingest_requests()
-            self.drain_requested_finishes(uncommitted=self._queued_batches())
+            self.drain_pending_finishes(uncommitted=self._queued_batches())
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -3746,7 +3746,7 @@ class Scheduler(
                         req.rid in seen_rids
                         or req.finished()
                         or req.to_finish is not None
-                        or req in self.requested_finishes
+                        or req in self.pending_finishes
                     ):
                         continue
                     seen_rids.add(req.rid)
@@ -3890,25 +3890,25 @@ class Scheduler(
         else:
             checkpoint_kv_cache(req, self.tree_cache)
 
-    def drain_requested_finishes(
+    def drain_pending_finishes(
         self, *, uncommitted: Iterable[Optional[ScheduleBatch]]
     ) -> None:
-        """Finish each requested finish now, unless an uncommitted step carries
+        """Finish each pending finish now, unless an uncommitted step carries
         its request: that step's commit applies it. The chunked request
         finishes now even with a chunk in flight, so no next chunk launches;
         the in-flight chunk's commit only drains its accounting."""
-        if not self.requested_finishes:
+        if not self.pending_finishes:
             return
         carried = {
             req for batch in uncommitted if batch is not None for req in batch.reqs
         }
-        for req in self.requested_finishes.reqs():
+        for req in self.pending_finishes.reqs():
             if req.finished():
-                self.requested_finishes.pop(req)
+                self.pending_finishes.pop(req)
             elif req is self.chunked_req or req not in carried:
-                self._finish_requested(req, self.requested_finishes.pop(req))
+                self._finish_pending(req, self.pending_finishes.pop(req))
 
-    def _finish_requested(self, req: Req, finish: RequestedFinish) -> None:
+    def _finish_pending(self, req: Req, finish: PendingFinish) -> None:
         """Finish a request no uncommitted step carries: release what it holds
         as a commit releases a request it finishes, then stream its last
         output."""
@@ -4071,11 +4071,11 @@ class Scheduler(
 
         # Every step, not only after a merge: overlap merges a prefill's requests
         # before its result finishes them, and update_running_batch may never run.
-        # A request with a requested finish leaves here too, before preemption,
+        # A request with a pending finish leaves here too, before preemption,
         # mixed chunk or retract can pick it.
         running_bs = running_batch.batch_size()
         running_batch.filter_batch(
-            reqs_to_exclude=self.requested_finishes.among(running_batch.reqs)
+            reqs_to_exclude=self.pending_finishes.among(running_batch.reqs)
         )
         if running_batch.batch_size() < running_bs:
             running_batch.batch_is_full = False
@@ -4580,10 +4580,10 @@ class Scheduler(
         ]
 
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
-        """Requests a queued result finishes: those with a requested finish it
+        """Requests a queued result finishes: those with a pending finish it
         carries, whether or not scheduling already left them out of batch, and
         those of batch committing their last output by length."""
-        finishing = self.requested_finishes.among(
+        finishing = self.pending_finishes.among(
             req for queued in self._queued_batches() for req in queued.reqs
         )
         if not self.enable_skip_finishing_decode or not self.result_queue:
@@ -5073,7 +5073,7 @@ class Scheduler(
         if self.enable_unified_cache_external_linker:
             # This forward ran on KV that never landed for these requests.
             for req in self.tree_cache.finish_external_linker_loads(batch.reqs):
-                self.requested_finishes.request(
+                self.pending_finishes.add(
                     req,
                     FINISH_ABORT(
                         "External KV cache load failed", HTTPStatus.SERVICE_UNAVAILABLE
@@ -5244,7 +5244,7 @@ class Scheduler(
             snapshot=snapshot,
         )
 
-        dropped_output = self._apply_requested_finishes(batch)
+        dropped_output = self._apply_pending_finishes(batch)
         if batch.forward_mode.is_decode():
             # Only a prefill step reports a failed KV load.
             assert not dropped_output, (
@@ -5280,19 +5280,19 @@ class Scheduler(
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
 
-    def _apply_requested_finishes(
+    def _apply_pending_finishes(
         self, batch: ScheduleBatch
     ) -> Dict[Req, BaseFinishReason]:
-        """Hand the requested finishes of this step's requests to its commit,
+        """Hand the pending finishes of this step's requests to its commit,
         which finishes each with its reason; returns those whose output this
         step must not commit. The chunked request's is the drain's."""
         dropped_output = {}
-        if not self.requested_finishes:
+        if not self.pending_finishes:
             return dropped_output
         for req in batch.reqs:
             if req is self.chunked_req:
                 continue
-            finish = self.requested_finishes.pop(req)
+            finish = self.pending_finishes.pop(req)
             if finish is None:
                 continue
             req.request_finish(finish.reason)
@@ -6021,7 +6021,7 @@ class Scheduler(
                     )
                 else:
                     reason = FINISH_ABORT()
-                self.requested_finishes.request(req, reason)
+                self.pending_finishes.add(req, reason)
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
@@ -6114,7 +6114,7 @@ class Scheduler(
         for req in retract_reqs:
             # A finish requested before the pause goes with the request to its
             # next commit.
-            if (finish := self.requested_finishes.pop(req)) is not None:
+            if (finish := self.pending_finishes.pop(req)) is not None:
                 req.request_finish(finish.reason)
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 if req.output_ids:
